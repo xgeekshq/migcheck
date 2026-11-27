@@ -1,0 +1,305 @@
+MANUAL CHECKS - LINUX VM (test migration, AVS vs Azure)
+=========================================================
+
+Run every check on the AVS VM first, then on the Azure copy, and compare.
+The sections follow the Linux sheet of "Test Migration Infrastructure Checks",
+and the commands are the same ones migcheck.sh runs (column C of the sheet).
+migcheck.sh does all of this for you; this file is for running a check by hand,
+or for digging into a line of the migcheck report.
+
+  The script : results go in the folder you run it from, so always cd there first.
+               cd ~/migcheck && bash migcheck.sh source      on AVS, before the recovery point
+               cd /home/<user>/migcheck && bash migcheck.sh target    on the test VM
+                    (Run Command starts in another folder: keep the cd)
+               ... bash migcheck.sh show            INFO and problem details, verdict last
+               ... bash migcheck.sh show services   one check in full
+               Inter-tier test: add  --peers 10.1.2.3:1433,app2.fqdn:443  to target.
+               The last line, RESULT, says all good or which checks to look at.
+               Run Command shows only the last 4 KB of output: use "show".
+
+  Shell      : SSH to the VM. On the Azure copy: portal > VM > Run command >
+               RunShellScript (runs as root, shows only the last 4 KB of output).
+  No sudo    : every command works without sudo. Where a section says
+               (more with sudo), some lines are hidden without it, not wrong;
+               add  sudo  in front only if you have it and need those lines.
+  Long output: add  | less  to scroll, or  > /tmp/name.txt  to save it.
+
+Legend
+  Look at : what to read in the output
+  Azure   : what is normal on the Azure copy, and what is a problem
+
+
+PLATFORM
+========
+
+1. VM BOOTS
+-----------
+    uptime -s
+
+Look at: date and time of the last boot.
+Azure  : a few minutes after the test migration started. If Run Command answers
+         at all, the VM booted.
+
+
+2. NO KERNEL OR BOOT ERRORS  (more with sudo)
+---------------------------------------------
+    journalctl -b -k -p err --no-pager -q
+
+Look at: disk, driver, file system (fsck) or mount errors from the kernel since boot.
+         Without sudo: "No journal files were opened" = your account is not in
+         systemd-journal / adm / wheel. Then use  dmesg --level=err  if allowed.
+Azure  : errors that also appear on AVS are not new. Normal in the test:
+         - VMware driver messages, Hyper-V and Azure agent messages
+         - journald "uncleanly shut down": the test VM boots from a copy of a running disk
+         - NFS / mount errors for shares outside the test
+         A problem: local disk or file system errors.
+         The report groups errors by kind (numbers shown as N), with how many times
+         each happened and the latest message as logged.
+
+
+3. AZURE VM AGENT READY
+-----------------------
+    systemctl list-units --all --no-legend --no-pager --plain 'waagent*' 'walinuxagent*'
+
+Look at: the ACTIVE column (third word).
+AVS    : nothing (the agent is not installed on AVS).
+Azure  : waagent.service (RHEL) or walinuxagent.service (Ubuntu) active.
+         Portal: VM > Overview > Agent status = Ready.
+More   : tail -20 /var/log/waagent.log
+
+
+STORAGE
+=======
+
+4. DISK COUNT AND SIZES MATCH SOURCE
+------------------------------------
+    lsblk -db -o NAME,SIZE,TYPE,MODEL
+
+Look at: number of lines with TYPE "disk", and SIZE (bytes) of each.
+Azure  : same disks and sizes. Device names (sda, sdb) can change: compare sizes.
+         Most Azure VM sizes add a temporary disk: don't count it. Which one it
+         is:  readlink -f /dev/disk/azure/resource
+
+
+5. FILESYSTEMS MOUNTED PER FSTAB
+--------------------------------
+    df -PTk -l -x tmpfs -x devtmpfs -x squashfs -x overlay
+
+Look at: "Mounted on", Type and size (1024-blocks) of each file system.
+Azure  : the same file systems mounted with the same sizes. The temporary disk
+         (often /mnt or /mnt/resource) is new and fine. A file system missing =
+         the VM may have booted without it: check /etc/fstab.
+More   : findmnt --verify     (fstab errors, e.g. a /dev/sdX name that changed)
+
+
+OS
+==
+
+6. HYPER-V DRIVERS LOADED
+-------------------------
+    ls /sys/bus/vmbus/drivers
+
+Look at: hv_storvsc (disks), hv_netvsc (network), hv_utils (shutdown, time sync).
+AVS    : "No such file or directory" (not a Hyper-V host): normal.
+Azure  : all three listed.
+
+
+7. NO VMWARE TOOLS LEFTOVERS FAILING
+------------------------------------
+    systemctl list-units --all --no-legend --no-pager --plain | grep -iE 'vmtoolsd|vmware|vgauth'
+
+Look at: the ACTIVE column (third word) of each VMware unit.
+AVS    : vmtoolsd active.
+Azure  : nothing, or inactive. "failed" = it tries to start on boot: remove
+         open-vm-tools after cutover.
+
+
+8. HOSTNAME CORRECT
+-------------------
+    hostname -s
+
+Look at: the short host name.
+Azure  : same as AVS.
+
+
+9. TIME SYNC
+------------
+    timedatectl
+
+Look at: "System clock synchronized" and "NTP service".
+Azure  : the clock is right (compare with your own). NTP to a domain controller
+         failing is normal in the isolated test network.
+
+
+NETWORK
+=======
+
+10. NIC AND IP ADDRESS CORRECT
+------------------------------
+    ip -4 -o addr show scope global
+
+Look at: interface name and IPv4 address. Gateway and DNS:
+         ip route show default ;  grep nameserver /etc/resolv.conf
+Azure  : the planned IP for this VM. The interface name can change (e.g. ens192
+         becomes eth0).
+
+
+11. GUEST USES DHCP
+-------------------
+    ip -4 -o addr show scope global
+
+Look at: the word "dynamic" on each line.
+Azure  : "dynamic" on every line. That is normal: the static IP is set in Azure,
+         not inside Linux. No "dynamic" = a static IP inside the VM, which breaks
+         the network in Azure.
+
+
+SERVICES
+========
+
+12. NO FAILED SYSTEMD UNITS
+---------------------------
+    systemctl --failed --no-legend --no-pager --plain
+
+Look at: units in failed state (services, mounts, timers, sockets).
+Azure  : same list as AVS. Normal in the test:
+         - sssd, realmd, chronyd / ntpd, NFS mounts (no IdM, NTP or NFS servers)
+         - subscription and update units: rhsm, insights-client, dnf / yum makecache,
+           packagekit, apt-daily, unattended-upgrades, snapd (no Red Hat, Ubuntu or
+           Satellite servers in the test)
+         - VMware units
+         Anything else new = a problem, above all units of the app itself.
+More   : details of one unit (replace myapp.service):
+         systemctl status myapp.service --no-pager ;  journalctl -u myapp.service -b --no-pager | tail -30
+
+
+13. SYSTEM SERVICES RUNNING AS EXPECTED
+---------------------------------------
+    systemctl list-units --type=service --state=running --no-legend --no-pager --plain
+
+Look at: all running services.
+Azure  : same list, for services enabled at boot. Normal differences:
+         - VMware services gone; Azure agent (waagent / walinuxagent) and Hyper-V
+           daemons (hv_kvp_daemon, hypervkvpd...) added
+         - static or disabled units run only when something starts them, so running
+           on one side only means nothing
+More   : how each unit starts, who runs it and which program (the report shows the same,
+         plus a category: APP? = program under /opt, /usr/local, /home, /srv or a unit
+         added in /etc/systemd/system, AGENT = monitoring / security tool, OS = the rest):
+         systemctl show -p Id -p UnitFileState -p User -p ExecStart $(systemctl list-units --type=service --state=running --no-legend --plain | awk '{print $1}') | grep -E '^(Id|UnitFileState|User|ExecStart)='
+         APP? units are most likely the application; the app owner confirms.
+
+
+14. JOURNAL ERRORS SINCE BOOT  (more with sudo)
+-----------------------------------------------
+    journalctl -b -p err --no-pager -q
+
+Look at: errors since boot, by program name.
+Azure  : errors that also appear on AVS are not new. Normal in the test:
+         - no IdM, DNS, NTP or NFS: sssd, krb5, ldap, chrony, nfs, mount errors
+         - no update servers: rhsm, insights-client, dnf / yum, apt, snapd errors
+         - journald "uncleanly shut down" (copy of a running disk)
+         What matters are new errors from the app. Read the message: a server,
+         database or URL outside the test = expected; inside the test, or a local
+         file, port or certificate = a real problem. The same error many times =
+         something keeps retrying.
+More   : each kind of error with how often it happened, most frequent first:
+         journalctl -b -p err --no-pager -q | sed -E 's/^[A-Za-z]{3} [ 0-9]{2} [0-9:]{8} [^ ]+ //; s/\[[0-9]+\]//' | sort | uniq -c | sort -rn | head -30
+
+
+15. SCHEDULED JOBS PRESENT  (more with sudo: user crontabs)
+-----------------------------------------------------------
+    find /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly /var/spool/cron -type f 2>/dev/null
+    systemctl list-timers --all --no-legend --no-pager
+
+Look at: 1st = cron files (one per job set, /var/spool/cron/<user> = that user's crontab).
+         2nd = systemd timers.
+Azure  : same jobs and timers. Content of a crontab:  crontab -l -u <user>
+
+
+CONNECTIVITY
+============
+
+16. LISTENING PORTS MATCH SOURCE  (more with sudo: every owner)
+---------------------------------------------------------------
+    ss -ltnp
+
+Look at: "Local Address:Port" and the program in users:(("name",...)).
+         0.0.0.0 or * = open to the network, 127.0.0.1 = this machine only.
+         Without sudo the program is shown only for your own processes.
+Azure  : same ports, owned by the same programs. A missing port = the app behind
+         it did not start. Ports 32768 and above change at every start: ignore them.
+         Arc agent ports 40341-40344 are on AVS only (Arc stops on an Azure VM): normal.
+
+
+17. LOCAL TCP PORTS RESPOND
+---------------------------
+    ss -ltn | awk 'NR > 1 {print $4}' | sort -u | while read -r a; do
+      h=${a%:*}; h=${h#[}; h=${h%]}; h=${h%%\%*}
+      case $h in '*'|0.0.0.0|::) h=127.0.0.1 ;; esac
+      timeout 3 bash -c "</dev/tcp/$h/${a##*:}" 2>/dev/null && echo "$a OK" || echo "$a FAIL"
+    done
+
+Look at: OK or FAIL, one line per listening port.
+Azure  : all OK. FAIL = something listens but does not answer.
+
+
+18. TLS CERTIFICATE SERVED
+--------------------------
+    ss -ltn | awk 'NR > 1 {print $4}' | sort -u | while read -r a; do
+      h=${a%:*}; h=${h#[}; h=${h%]}; h=${h%%\%*}
+      case $h in '*'|0.0.0.0|::) h=127.0.0.1 ;; *:*) h="[$h]" ;; esac
+      c=$(echo | timeout 5 openssl s_client -connect "$h:${a##*:}" 2>/dev/null | openssl x509 -noout -subject -enddate 2>/dev/null)
+      [ -n "$c" ] && echo "$a" $c
+    done
+
+Look at: one line per port that speaks TLS: subject (whose certificate) and
+         notAfter (expiry date).
+Azure  : same certificates as AVS, notAfter in the future. This shows the default
+         certificate of each port; for one site name add  -servername app.fqdn
+         after -connect.
+
+
+19. INTER-TIER CONNECTIVITY
+---------------------------
+Replace the two examples with the other tiers this VM talks to (from the
+dependency map), as server:port.
+
+    for t in 10.1.2.3:1433 app2.fqdn:443; do timeout 3 bash -c "</dev/tcp/${t%:*}/${t##*:}" 2>/dev/null && echo "$t OK" || echo "$t FAIL"; done
+
+Look at: OK or FAIL for each tier.
+Azure  : OK for every tier that is in the same test. FAIL to a tier outside the
+         test is expected (isolated network).
+
+
+20. ESTABLISHED CONNECTIONS BETWEEN TIERS
+-----------------------------------------
+    ss -tn state established
+
+Look at: "Peer Address:Port" = who this VM is talking to right now.
+Azure  : the same peers as AVS for tiers inside the test. Peers outside the test
+         (IdM, DNS, other apps) disappear: that is expected.
+
+
+21. BLOCKED OUTBOUND ATTEMPTS  (more with sudo: the program)
+------------------------------------------------------------
+    ss -tnp state syn-sent
+
+Look at: "Peer Address:Port" the VM tries to reach and cannot, and the program.
+Azure  : destinations outside the test = expected. Inside the test = a problem
+         (firewall, NSG or wrong IP).
+
+
+SECURITY
+========
+
+22. DOMAIN / IDM DEPENDENCY (EXPECTED FAILURE)
+----------------------------------------------
+    realm list
+    systemctl is-active sssd
+
+Look at: domain-name and configured (if joined), and the sssd state.
+AVS    : the IdM / AD domain, sssd active.
+Azure  : sssd may be failed or unable to reach the domain. Expected: there is no
+         IdM in the test. Record it, it is not a defect. Domain logins fail, so
+         use a local account to get in.

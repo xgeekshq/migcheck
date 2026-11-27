@@ -1,0 +1,336 @@
+MANUAL CHECKS - WINDOWS VM (test migration, AVS vs Azure)
+===========================================================
+
+Run every check on the AVS VM first, then on the Azure copy, and compare.
+The sections follow the Windows sheet of "Test Migration Infrastructure Checks",
+and the commands are the same ones migcheck.ps1 runs (column C of the sheet).
+migcheck.ps1 does all of this for you; this file is for running a check by hand,
+or for digging into a line of the migcheck report.
+
+  The script : C:\migcheck\migcheck.ps1 source   on AVS, before the recovery point
+               C:\migcheck\migcheck.ps1 target   on the test VM (Run Command)
+               C:\migcheck\migcheck.ps1 show     INFO and problem details, verdict last
+               C:\migcheck\migcheck.ps1 show services   one check in full
+               The last line, RESULT, says all good or which checks to look at.
+               Run Command shows only the last 4 KB of output: use "show".
+
+  PowerShell : Win+R, type powershell, Enter   (Tab completes names: type Get-Ser then Tab)
+  As admin   : right-click Start > Windows PowerShell (Admin). Only needed where a
+               section says (admin). On the Azure VM, portal > VM > Run command >
+               RunPowerShellScript always runs as admin.
+  Long output: add  | Out-File C:\temp\name.txt  at the end and open the file.
+
+Legend
+  Look at : what to read in the output
+  Azure   : what is normal on the Azure copy, and what is a problem
+
+
+PLATFORM
+========
+
+1. VM BOOTS
+-----------
+    (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+
+Look at: date and time of the last boot.
+Azure  : a few minutes after the test migration started. If Run Command answers
+         at all, the VM booted.
+
+
+2. NO BOOT OR SYSTEM ERRORS
+---------------------------
+    Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2; StartTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime } -ErrorAction SilentlyContinue
+
+Look at: ProviderName and Id of each error since boot, and its message.
+Azure  : errors that also appear on AVS are not new. Normal in the test:
+         - no domain controller: NETLOGON, GroupPolicy, Time-Service, DNS-Client, Kerberos
+         - EventLog 6008 "unexpected shutdown": the test VM boots from a copy of a running disk
+         - VMware driver / service errors, Hyper-V and Azure agent messages
+         - Service Control Manager 7000 / 7034 / 7038 for a service on a domain account
+           (see section 15): it cannot log on without a domain controller
+         A problem: disk, driver or boot-start errors, or the app's own services
+         failing for another reason.
+More   : the message of each kind of error, with how often it happened (the report
+         shows the same: key | count | first line of the message):
+         Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2; StartTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime } -ErrorAction SilentlyContinue | Group-Object ProviderName, Id | Sort-Object Count -Descending | ForEach-Object { '{0,4}x  {1}  {2}' -f $_.Count, $_.Name, (($_.Group[0].Message -split "`n")[0]) }
+
+
+3. AZURE VM AGENT READY
+-----------------------
+    Get-Service WindowsAzureGuestAgent, RdAgent -ErrorAction SilentlyContinue
+
+Look at: Status.
+AVS    : nothing (the agent is not installed on AVS).
+Azure  : WindowsAzureGuestAgent Running. Portal: VM > Overview > Agent status = Ready.
+More   : Get-Content C:\WindowsAzure\Logs\WaAppAgent.log -Tail 20
+
+
+STORAGE
+=======
+
+4. DISK COUNT AND SIZES MATCH SOURCE
+------------------------------------
+    Get-CimInstance Win32_DiskDrive | Select-Object DeviceID, Model, Size
+
+Look at: number of disks and Size (bytes) of each.
+Azure  : same disks. Model becomes "Microsoft Virtual Disk". A disk can be one Azure
+         size step larger (e.g. 100 GB -> 128 GB, 255 GB -> 256 GB): fine if section 6
+         shows the same drive sizes (the extra space is just not used yet).
+         Some VM sizes add a "Temporary Storage" disk: don't count it.
+
+
+5. ALL DISKS ONLINE  (admin)
+----------------------------
+    Get-Disk -ErrorAction Stop | Where-Object { $_.IsOffline -or $_.IsReadOnly }
+
+Look at: any line at all.
+Azure  : no output. A disk listed here is offline or read-only (the SAN policy
+         often leaves data disks offline after migration): bring it online in
+         Disk Management (diskmgmt.msc).
+More   : Get-StorageSetting | Select NewDiskPolicy
+
+
+6. DRIVE LETTERS AND VOLUMES MATCH SOURCE
+-----------------------------------------
+    Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Where-Object VolumeName -ne 'Temporary Storage'
+
+Look at: DeviceID (drive letter), VolumeName (label), Size, FreeSpace.
+Azure  : same letters, labels and sizes. Check the temporary disk did not take a
+         letter the data disks used on AVS (e.g. D:).
+
+
+OS
+==
+
+7. HOSTNAME CORRECT
+-------------------
+    Get-CimInstance Win32_ComputerSystem | Select-Object Name, Domain
+
+Look at: Name and Domain.
+Azure  : same as AVS.
+
+
+8. NO VMWARE TOOLS LEFTOVERS
+----------------------------
+    Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*, HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object Publisher -like 'VMware*' | Select-Object DisplayName, DisplayVersion, Publisher
+
+Look at: software published by VMware still installed.
+AVS    : VMware Tools listed.
+Azure  : ideally nothing. If VMware Tools is still there, uninstall it after cutover;
+         until then its vmStatsProvider errors (257 / 259) in the Application log are
+         expected. Microsoft products with "VMware" in the name (e.g. Microsoft Azure
+         VMware Assessment Service) are not VMware Tools and are not listed.
+
+
+9. TIME SYNC
+------------
+    w32tm /query /status
+
+Look at: Source and Last Successful Sync Time.
+Azure  : Source "VM IC Time Synchronization Provider" (time from the Azure host) is
+         normal. Check the clock is right (compare with your own). Sync with a domain
+         controller failing is normal in the isolated test network.
+
+
+NETWORK
+=======
+
+10. NIC AND IP ADDRESS CORRECT
+------------------------------
+    Get-NetIPConfiguration
+
+Look at: IPv4Address, IPv4DefaultGateway, DNSServer, number of adapters.
+Azure  : the planned IP for this VM. DNS 168.63.129.16 is Azure's own DNS (normal in
+         the test network), or the DNS servers set on the Azure VNet.
+
+
+11. GUEST USES DHCP
+-------------------
+    Get-NetIPInterface -AddressFamily IPv4 -ConnectionState Connected | Where-Object InterfaceAlias -notlike 'Loopback*'
+
+Look at: Dhcp column.
+Azure  : Enabled. That is normal: the static IP is set in Azure, not inside Windows.
+         Disabled = a static IP inside Windows, which breaks the network in Azure.
+
+
+12. NO GHOST NIC HOLDING OLD CONFIG
+-----------------------------------
+    Get-PnpDevice -Class Net | Where-Object Status -eq 'Unknown'
+
+Look at: hidden network adapters left from VMware.
+Azure  : the old VMware adapter (vmxnet3) is normally listed: that is fine on its own.
+         A problem only if it still holds the old static IP and Windows complains
+         the IP is a duplicate. Fix: Device Manager > View > Show hidden devices >
+         Network adapters > uninstall the greyed-out VMware adapter.
+
+
+SERVICES
+========
+
+13. AUTOMATIC SERVICES RUNNING
+------------------------------
+    Get-CimInstance Win32_Service -Filter "StartMode='Auto' AND State<>'Running'"
+
+Look at: services set to Automatic that are NOT running.
+Azure  : same list as AVS. A service new on this list = it failed to start after
+         the move. This is the key check: compare with AVS.
+         Delayed or trigger-start services (e.g. wuauserv, sppsvc, RemoteRegistry)
+         start and stop on their own: a difference in them is not a problem.
+         Window: services.msc, sort by Status ("Automatic (Delayed Start)" and
+         "Automatic (Trigger Start)" are shown in the Startup Type column).
+More   : start type, account, company and program of each, to tell Windows services
+         (Microsoft, svchost.exe) from the app's and agents' (see section 14).
+
+
+14. SYSTEM SERVICES RUNNING AS EXPECTED
+---------------------------------------
+    Get-CimInstance Win32_Service -Filter "State='Running'"
+
+Look at: all running services.
+Azure  : same list, for Automatic services. Normal differences:
+         - VMware services gone; Azure agent (WindowsAzureGuestAgent, RdAgent) and
+           Hyper-V (vmic...) services added
+         - Manual or trigger-start services (e.g. BITS, Appinfo, COMSysApp) run only
+           when something needs them, so running on one side only means nothing
+         - per-user services (name ending _ and a hex code, e.g. CDPUserSvc_1a2b3c4d)
+           depend on who is logged on
+More   : who made each service, its account and start type (the report shows the same):
+         Get-CimInstance Win32_Service -Filter "State='Running'" | ForEach-Object { $exe = "$($_.PathName)" -replace '^"?([^"]*?\.exe).*$', '$1'; [pscustomobject]@{ Name = $_.Name; Start = $_.StartMode; Account = $_.StartName; Company = (Get-Item $exe -ErrorAction SilentlyContinue).VersionInfo.CompanyName; Program = $exe } } | Format-Table -AutoSize
+         Microsoft Corporation + C:\Windows\... = Windows. Another company, a program
+         under Program Files or another drive, or a domain account = the app or an agent
+         (backup, antivirus, monitoring). The app owner confirms which ones are the app.
+
+
+15. SERVICES RUNNING AS DOMAIN ACCOUNTS
+---------------------------------------
+    Get-CimInstance Win32_Service | Where-Object StartName -notmatch '^(LocalSystem|NT AUTHORITY\\|NT SERVICE\\)' | Select-Object Name, StartName, State
+
+Look at: StartName with a domain (DOMAIN\user, or a gMSA ending in $).
+Azure  : these services fail in the test because there is no domain controller.
+         Record them as expected, not as a migration defect. They also explain the
+         matching lines in sections 2, 13, 14 and 18 (errors 7000 / 7038, service
+         stopped, its port gone).
+
+
+16. APPLICATION LOG ERRORS SINCE BOOT
+-------------------------------------
+    Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Level = 1, 2; StartTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime } -ErrorAction SilentlyContinue
+
+Look at: ProviderName and Id of each error since boot, and its message.
+Azure  : errors that also appear on AVS are not new. Normal in the test:
+         - Microsoft-Windows-Security-SPP 8198: Windows activation cannot reach KMS
+           (the message has the error code, e.g. hr=0xC004F074)
+         - vmStatsProvider 257 / 259: VMware Tools still installed (section 8)
+         What matters are new errors from the app itself. Read the message: a server,
+         database or URL outside the test = expected; inside the test, or a local
+         file, port or certificate = a real problem. The same error many times =
+         something keeps retrying.
+More   : the same summary as for the System log (section 2), with 'Application'.
+         Window: eventvwr > Windows Logs > Application > Filter Current Log >
+         tick Critical and Error.
+
+
+17. SCHEDULED TASKS PRESENT  (admin, to see all tasks)
+------------------------------------------------------
+    Get-ScheduledTask | Where-Object { $_.State -ne 'Disabled' -and $_.TaskPath -notlike '\Microsoft\*' }
+
+Look at: TaskName and TaskPath of the app's own tasks.
+Azure  : same tasks. Tasks that run as a domain account will fail in the test.
+         Window: taskschd.msc.
+
+
+CONNECTIVITY
+============
+
+18. LISTENING PORTS MATCH SOURCE
+--------------------------------
+    Get-NetTCPConnection -State Listen | Sort-Object LocalPort
+
+Look at: LocalAddress, LocalPort and OwningProcess (the PID).
+         0.0.0.0 = open to the network, 127.0.0.1 = this machine only.
+         Which program owns a PID:  Get-Process -Id 1234
+Azure  : same ports. A missing port = the app behind it did not start.
+         Ports 49152 and above change at every boot: ignore them.
+Owner "System" (PID 4) = the Windows HTTP driver (HTTP.sys) on behalf of a program.
+         Find the program (no admin needed; replace 8080 with the port):
+         ((netsh http show servicestate view=requestq) -join "`n") -split '(?=Request queue name)' | Where-Object { $_ -match ':8080' }
+         then, with the number under "Process IDs":  tasklist /svc /fi "PID eq 1234"
+
+
+19. LOCAL TCP PORTS RESPOND
+---------------------------
+    Get-NetTCPConnection -State Listen | Where-Object { $_.LocalAddress -notmatch ':' -and $_.LocalPort -lt 49152 } | Select-Object LocalAddress, LocalPort -Unique | ForEach-Object {
+        $h = if ($_.LocalAddress -eq '0.0.0.0') { '127.0.0.1' } else { $_.LocalAddress }
+        $c = New-Object Net.Sockets.TcpClient
+        $open = try { $c.ConnectAsync($h, $_.LocalPort).Wait(2000) } catch { $false }
+        $c.Close()
+        [pscustomobject]@{ Endpoint = "${h}:$($_.LocalPort)"; Open = $open } }
+
+Look at: Open column, one line per listening port.
+Azure  : all True. False = something listens but does not answer.
+
+
+20. INTER-TIER CONNECTIVITY
+---------------------------
+Replace the two examples with the other tiers this VM talks to (from the
+dependency map), as server:port.
+
+    '10.1.2.3:1433', 'app2.fqdn:443' | ForEach-Object {
+        $h, $p = $_ -split ':'
+        [pscustomobject]@{ Endpoint = $_; Open = Test-NetConnection $h -Port $p -InformationLevel Quiet -WarningAction SilentlyContinue } }
+
+Look at: Open column. A closed port takes about 20 seconds to answer False.
+Azure  : True for every tier that is in the same test. False to a tier outside
+         the test is expected (isolated network).
+
+
+21. ESTABLISHED CONNECTIONS BETWEEN TIERS
+-----------------------------------------
+    Get-NetTCPConnection -State Established | Where-Object RemoteAddress -notmatch '^(127\.|::1$)' | Sort-Object RemoteAddress
+
+Look at: RemoteAddress and RemotePort = who this VM is talking to right now.
+Azure  : the same peers as AVS for tiers inside the test. Peers outside the test
+         (domain controllers, other apps) disappear: that is expected.
+
+
+22. BLOCKED OUTBOUND ATTEMPTS
+-----------------------------
+    Get-NetTCPConnection -State SynSent -ErrorAction SilentlyContinue
+
+Look at: RemoteAddress and RemotePort the VM tries to reach and cannot.
+Azure  : destinations outside the test = expected. Inside the test = a problem
+         (firewall, NSG or wrong IP).
+
+
+APPLICATION
+===========
+
+23. TLS CERTIFICATES AND BINDINGS  (admin, to see all bindings)
+---------------------------------------------------------------
+    netsh http show sslcert
+
+Look at: IP:port (or Hostname:port) and Certificate Hash of each HTTPS binding.
+         To check the certificate behind a hash (IIS can also keep it in WebHosting):
+         Get-ChildItem Cert:\LocalMachine\My, Cert:\LocalMachine\WebHosting | Select-Object Thumbprint, Subject, NotAfter
+Azure  : same bindings, and each hash is in the list above with NotAfter in the future.
+
+
+24. FILE SHARES PRESENT
+-----------------------
+    Get-CimInstance Win32_Share -Filter 'Type=0' | Where-Object Name -notmatch '\$$'
+
+Look at: Name and Path of each share (admin shares like C$ are left out).
+Azure  : same shares. Users from the domain cannot open them in the test: expected.
+
+
+SECURITY
+========
+
+25. DOMAIN DEPENDENCY (EXPECTED FAILURE)
+----------------------------------------
+    nltest "/sc_query:$((Get-CimInstance Win32_ComputerSystem).Domain)" 2>&1
+
+Look at: the Status line.
+AVS    : Status = 0 0x0 NERR_Success.
+Azure  : an error such as ERROR_NO_LOGON_SERVERS. Expected: there is no domain
+         controller in the test. Record it, it is not a defect.
