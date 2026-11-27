@@ -35,6 +35,8 @@
 #      cd /home/<user>/migcheck && bash migcheck.sh target
 #    Collects target/, compares, prints one line per check. The last line is the verdict.
 #    Inter-tier test: add  --peers 10.1.2.3:1433,app2.fqdn:443
+#    Without <folder>/source (no access to AVS) the report is on the test VM alone: no PASS/DIFF,
+#    compared checks are listed as INFO, and failed app units FAIL.
 # 3. Compare again only:   cd /home/<user>/migcheck && bash migcheck.sh compare
 #    Problems and INFO:    cd /home/<user>/migcheck && bash migcheck.sh show   (their detail, then summary and verdict)
 #    Detail of one check:  cd /home/<user>/migcheck && bash migcheck.sh show services   (the name after the tag)
@@ -475,7 +477,11 @@ rule() {
   while IFS= read -r e; do DET+=("   $e"); done < <(res target "$4")
 }
 info() {
-  local s t; s=$(res source "$1" | join ', '); t=$(res target "$1" | join ', ')
+  local s t
+  if [ "$SOLO" = 1 ]; then
+    rule INFO "$1" "$(res target "$1" | join ', ')" "$1"; return
+  fi
+  s=$(res source "$1" | join ', '); t=$(res target "$1" | join ', ')
   line INFO "$1" "AVS $s -> Azure $t"; DET+=("== $1 (info)" "   AVS  : $s" "   Azure: $t")
 }
 # Compare one file with AVS. newonly: only what is new on Azure counts. goneonly: only what is missing
@@ -486,6 +492,7 @@ check() {
   local n=$1 a newonly=0 goneonly=0 key=0 matchline=0 tag=DIFF exp sign k item l c first="" real=0 noise=0 out=()
   for a in "${@:2}"; do case $a in newonly) newonly=1 ;; goneonly) goneonly=1 ;; infoonly) tag=INFO ;;
     key=*) key=${a#key=} ;; matchline) matchline=1 ;; esac; done
+  if [ "$SOLO" = 1 ]; then solo "$n" "$key" "$matchline"; return; fi
   exp=$(expected "$n")
   if [ ! -f "$ROOT/source/$n.txt" ] || [ ! -f "$ROOT/target/$n.txt" ]; then line MISS "$n" 'result file missing'; return; fi
   while IFS=$'\t' read -r sign k item; do
@@ -515,6 +522,44 @@ check() {
   elif [ $noise -gt 0 ]; then line PASS "$n" "($noise expected difference(s), see report)"
   else line PASS "$n" ''; fi
 }
+# Without AVS results (no access to the AVS VM, or a recovery point older than "source") a compared
+# check is judged on the test VM alone: its lines are listed, still marked "~ expected" when they are.
+# Checks in SOLO_LOOK go into the verdict's "look at" when they have unexpected lines: with no baseline,
+# only the app owner can say whether they are right.
+SOLO_LOOK=' errors jobs ports sessions '
+solo() {
+  local n=$1 key=$2 matchline=$3 exp l k tag=INFO text look=0 all=() real=() out=() apps
+  exp=$(expected "$n")
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    all+=("$l"); k=$l
+    if [ "$matchline" = 0 ] && [ "$key" -gt 0 ]; then k=$(printf '%s\n' "$l" | cut -d'|' -f"$key" | sed 's/^ *//; s/ *$//'); fi
+    if [ -n "$exp" ] && printf '%s\n' "$k" | grep -qiE "$exp"; then out+=("~ expected : $l"); else real+=("$l"); out+=("$l"); fi
+  done < <(res target "$n")
+  case " $SOLO_LOOK " in *" $n "*) [ ${#real[@]} -gt 0 ] && look=1 ;; esac
+  units() { cut -d'|' -f2 | sed 's/^ *//; s/ (.*//' | join ', '; }
+  case $n in
+    failed)
+      apps=$(printf '%s\n' "${real[@]}" | grep '^APP?')
+      if [ -n "$apps" ]; then tag=FAIL; text="$(printf '%s\n' "$apps" | grep -c .) app unit(s) failed: $(printf '%s\n' "$apps" | units)"
+      elif [ ${#real[@]} -gt 0 ]; then text="${#real[@]} unit(s) failed: $(printf '%s\n' "${real[@]}" | units)"
+      else tag=OK; text='no failed unit'; [ ${#all[@]} -gt 0 ] && text="$text (${#all[@]} expected)"; fi ;;
+    services)
+      text="$(printf '%s\n' "${all[@]}" | grep -c '^AGENT') agent(s), $(printf '%s\n' "${all[@]}" | grep -c '^APP?') app service(s)" ;;
+    ports) text="${#all[@]} listening" ;;
+    jobs) text="${#all[@]} job(s)" ;;
+    software) text="${#all[@]} package(s)" ;;
+    *)
+      if [ ${#all[@]} -eq 0 ]; then text=none
+      elif [ ${#all[@]} -le 3 ]; then text=$(printf '%s\n' "${all[@]}" | join ', ')
+      elif [ ${#real[@]} -gt 0 ]; then text="${#all[@]} line(s), e.g. $(printf '%s\n' "${real[0]}" | cut -d'|' -f1 | sed 's/ *$//')"
+      else text="${#all[@]} line(s), all expected"; fi ;;
+  esac
+  [ $look = 1 ] && LOOK="$LOOK $n "
+  line "$tag" "$n" "$text"; DET+=("== $n ($tag)")
+  k=$(columns "$n"); [ -n "$k" ] && [ ${#all[@]} -gt 0 ] && DET+=("   columns: $k")
+  for l in "${out[@]}"; do DET+=("   $l"); done
+}
 # Without root the journal is readable only for members of systemd-journal / adm / wheel:
 # if one side could not read it, the Azure errors are listed, not compared.
 journal_check() {
@@ -526,27 +571,48 @@ journal_check() {
 }
 
 compare_all() {
-  if [ ! -d "$ROOT/source" ]; then
-    echo "No $ROOT/source: run from the folder where \"source\" ran on AVS (cd there first)."
-    echo 'If that is the folder, the recovery point is older than the AVS collection: wait for a newer one and test-migrate again.'; exit 1
+  if [ ! -d "$ROOT/target" ]; then
+    echo "No $ROOT/target: run target first, from the folder where the script is (cd there first)."; exit 1
   fi
-  local c f counts bad verdict
+  local c f counts bad badtag verdict legend note="" head=()
+  # collected.txt is written last, so an interrupted or empty source/ also counts as no AVS results.
+  SOLO=0; [ -f "$ROOT/source/collected.txt" ] || SOLO=1
+  NOTCOL=(); LOOK=' '
   PARTIAL=0; { res source elevated; res target elevated; } | grep -qx False && PARTIAL=1
-  if [ "$PARTIAL" = 1 ]; then
+  if [ "$SOLO" = 1 ]; then
+    res target elevated | grep -qx False && line INFO noroot "test VM run without root: port owners, other users' cron jobs and maybe the journal not visible"
+  elif [ "$PARTIAL" = 1 ]; then
     line INFO noroot "run without root on $({ res source elevated | grep -qx False && echo AVS; res target elevated | grep -qx False && echo Azure; } | join ' and '): ports without owner, jobs only missing on Azure"
   fi
-  for c in "${CHECKS[@]}"; do f=${c%%|*}; "judge_$f"; done
+  for c in "${CHECKS[@]}"; do
+    f=${c%%|*}
+    if [ "$SOLO" = 1 ] && [ ! -f "$ROOT/target/$f.txt" ]; then NOTCOL+=("$f"); continue; fi
+    "judge_$f"
+  done
 
+  if [ "$SOLO" = 1 ]; then
+    head=("source $(res target collected | awk '{print $2}') not collected (no access to AVS)" "$(res target collected)")
+    note='No PASS/DIFF lines: there is no AVS data to compare with.'
+    legend='OK/FAIL = rule on the test VM, INFO = shown only, ~ expected = normal after the move'
+    badtag='FAIL|ERR'
+  else
+    head=("$(res source collected)" "$(res target collected)")
+    legend='PASS/DIFF = compared with AVS, OK/FAIL = rule on the test VM, INFO = shown only, ~ expected = normal after the move'
+    badtag='DIFF|FAIL|MISS|ERR'
+  fi
   counts=$(printf '%s\n' "${SUM[@]}" | awk '{print $1}' | sort | uniq -c | awk '{printf "%s%s %s", (NR > 1 ? ", " : ""), $1, $2}')
-  bad=$(printf '%s\n' "${SUM[@]}" | awk '$1 ~ /^(DIFF|FAIL|MISS|ERR)$/ {print $2}' | join ', ')
+  bad=$(printf '%s\n' "${SUM[@]}" | awk -v t="^($badtag)\$" -v look="$LOOK" '$1 ~ t || ($1 == "INFO" && index(look, " " $2 " ")) {print $2}' | join ', ')
   if [ -n "$bad" ]; then verdict="RESULT: $counts -> look at: $bad  (migcheck.sh show <name>)"
+  # Without a baseline nothing can be called "all good".
+  elif [ "$SOLO" = 1 ]; then verdict="RESULT: $counts -> no FAIL, review INFO lines with the app owner"
   else verdict="RESULT: $counts -> all good, review INFO lines"; fi
+  # Added after the counts: it is not a result tag.
+  [ ${#NOTCOL[@]} -gt 0 ] && SUM+=("NOT COLLECTED  $(printf '%s\n' "${NOTCOL[@]}" | join ', ')")
 
-  { res source collected; res target collected
-    echo 'PASS/DIFF = compared with AVS, OK/FAIL = rule on the test VM, INFO = shown only, ~ expected = normal after the move'
+  { printf '%s\n' "${head[@]}"; echo "$legend"; [ -n "$note" ] && echo "$note"
     echo; printf '%s\n' "${SUM[@]}"; echo "$verdict"; echo; printf '%s\n' "${DET[@]}"; } > "$ROOT/report.txt"
   # Run Command keeps only the last 4 KB of output, so the verdict goes last.
-  res source collected; res target collected; printf '%s\n' "${SUM[@]}"; echo "Detail: $ROOT/report.txt"; echo "$verdict"
+  printf '%s\n' "${head[@]}"; [ -n "$note" ] && echo "$note"; printf '%s\n' "${SUM[@]}"; echo "Detail: $ROOT/report.txt"; echo "$verdict"
 }
 
 # Report sections start with "== <name>", so one check can be printed without the rest.
@@ -557,7 +623,7 @@ show_report() {
     # Details first and summary last: Run Command keeps the end of the output if it is too long.
     local names; names=" $(grep -E '^(INFO|DIFF|FAIL|MISS|ERR)[[:space:]]' "$rp" | awk '{printf "%s ", $2}')"
     awk -v list="$names" '/^== / {p = index(list, " " $2 " ") > 0} p' "$rp"
-    echo; grep -E '^(INFO|DIFF|FAIL|MISS|ERR)[[:space:]]|^RESULT:' "$rp"; return
+    echo; grep -E '^(INFO|DIFF|FAIL|MISS|ERR)[[:space:]]|^NOT COLLECTED|^RESULT:' "$rp"; return
   fi
   if grep -q "^== $NAME[ :]" "$rp"; then awk -v n="$NAME" '/^== / {p = ($2 == n)} p' "$rp"
   else echo "No check '$NAME' in the report. Names: $(awk '/^== / {print $2}' "$rp" | join ', ')"; fi

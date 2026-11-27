@@ -27,6 +27,8 @@ the test VM then boots with the script and the AVS results already on its disk.
    Collects target\, compares, prints one line per check (under Run Command's 4 KB limit).
    Inter-tier test: add -Peers 10.1.2.3:1433,app2.fqdn:443
    The last line is the verdict: RESULT ... all good, or which checks need a look.
+   Without C:\migcheck\source (no access to AVS) the report is on the test VM alone: no PASS/DIFF,
+   compared checks are listed as INFO, and app services on Auto that are not running FAIL.
 3. Compare again only:   ... migcheck.ps1 compare
    Problems and INFO:    ... migcheck.ps1 show      (their detail, then their summary lines and the verdict)
    Detail of one check:  ... migcheck.ps1 show services      (the name after the tag in the summary)
@@ -132,6 +134,7 @@ function Line($tag, $name, $text) {
 # -KeyField n: compare only column n (counted from 0) of lines split at "|"; the rest is shown, not compared.
 # -MatchLine: test the expected patterns on the whole line instead of the compared column.
 function Check($name, [switch]$NewOnly, [switch]$GoneOnly, [switch]$InfoOnly, [int]$KeyField = -1, [switch]$MatchLine) {
+    if ($script:Solo) { Solo $name $KeyField -MatchLine:$MatchLine; return }
     if (-not (Has source $name) -or -not (Has target $name)) { Line MISS $name 'result file missing'; return }
     $s = @(Res source $name); $t = @(Res target $name); $exp = $Expected[$name]
     $key = { param($l) if ($KeyField -ge 0) { "$(($l -split '\|')[$KeyField])".Trim() } else { $l } }
@@ -152,6 +155,7 @@ function Check($name, [switch]$NewOnly, [switch]$GoneOnly, [switch]$InfoOnly, [i
 }
 # Shown side by side, not compared.
 function Info($name) {
+    if ($script:Solo) { $t = @(Res target $name); Rule INFO $name ($t -join ', ') $t; return }
     $s = @(Res source $name) -join ', '; $t = @(Res target $name) -join ', '
     Line INFO $name "AVS $s -> Azure $t"
     $Det.Add("== $name (info)"); $Det.Add("   AVS  : $s"); $Det.Add("   Azure: $t")
@@ -162,6 +166,43 @@ function Rule($tag, $name, $text, $lines) {
     $Det.Add("== $name ($tag)")
     if ($Columns[$name] -and @($lines).Count) { $Det.Add("   columns: $($Columns[$name])") }
     @($lines) | ForEach-Object { $Det.Add("   $_") }
+}
+# Without AVS results (no access to the AVS VM, or a recovery point older than "source") a compared
+# check is judged on the test VM alone: its lines are listed, still marked "~ expected" when they are.
+# Checks in $SoloLook go into the verdict's "look at" when they have unexpected lines: with no baseline,
+# only the app owner can say whether they are right.
+$SoloLook = 'apperr', 'ports', 'sessions'
+function Solo($name, [int]$KeyField = -1, [switch]$MatchLine) {
+    $t = @(Res target $name); $exp = $Expected[$name]
+    $isExp = { param($l) $k = if ($MatchLine -or $KeyField -lt 0) { $l } else { "$(($l -split '\|')[$KeyField])".Trim() }; $exp -and $k -match $exp }
+    $real = @($t | Where-Object { -not (& $isExp $_) })
+    $lines = @($t | ForEach-Object { if (& $isExp $_) { "~ expected : $_" } else { $_ } })
+    $svc = { param($l) (@($l) | ForEach-Object { ($_ -split '\|')[1].Trim() -replace ' \(.*$', '' }) -join ', ' }
+    $tag = 'INFO'; $look = $real.Count -and $SoloLook -contains $name
+    $text = switch ($name) {
+        autostop {
+            $app = @($real | Where-Object { $_ -match '^APP\?' })
+            if ($app.Count) { $tag = 'FAIL'; '{0} app service(s) on Auto not running: {1}' -f $app.Count, (& $svc $app) }
+            elseif ($real.Count) { '{0} service(s) on Auto not running: {1}' -f $real.Count, (& $svc $real) }
+            else { $tag = 'OK'; 'all Auto services running' } }
+        services { '{0} agent(s), {1} app service(s)' -f @($t -match '^AGENT').Count, @($t -match '^APP\?').Count }
+        tasks {
+            # Per-user tasks (OneDrive, Edge, ... named after the user's SID or a GUID) run as whoever logs on.
+            $user = @($t | Where-Object { ($_ -split '\|')[0].Trim() -notmatch '(S-1-5-21-[\d-]+|\{[0-9A-Fa-f-]+\})$' -and
+                ($_ -split '\|')[1].Trim() -notmatch '^(SYSTEM|LOCAL SERVICE|NETWORK SERVICE|INTERACTIVE|Users|Administrators|S-1-5-[\d-]+|)$' })
+            $look = $user.Count -gt 0
+            if ($user.Count) { '{0} task(s) on user accounts, fail without DC if domain: {1}' -f $user.Count, (($user | ForEach-Object { ($_ -split '\|')[0].Trim() }) -join ', ') }
+            else { '{0} task(s), none on a user account' -f $t.Count } }
+        ports { '{0} listening' -f $t.Count }
+        http { if ($t.Count) { '{0} URL(s), e.g. {1}' -f $t.Count, $t[0] } else { 'none' } }
+        default {
+            if (-not $t.Count) { 'none' }
+            elseif ($t.Count -le 3) { $t -join ', ' }
+            elseif ($real.Count) { '{0} line(s), e.g. {1}' -f $t.Count, ($real[0] -split '\|')[0].Trim() }
+            else { '{0} line(s), all expected' -f $t.Count } }
+    }
+    if ($look) { $script:Look.Add($name) }
+    Rule $tag $name $text $lines
 }
 
 # ---------- checks, in the order of the Windows sheet ----------
@@ -581,23 +622,41 @@ function Collect($side) {
 }
 
 function Compare-All {
-    if (-not (Test-Path (Join-Path $Root 'source'))) {
-        "No $Root\source on this VM: the recovery point is older than the AVS collection."
-        'Run "source" on the AVS VM, wait for a newer recovery point and test-migrate again.'; exit 1 }
+    if (-not (Test-Path (Join-Path $Root 'target'))) { "No $Root\target yet: run target first."; exit 1 }
+    # collected.txt is written last, so an interrupted or empty source\ also counts as no AVS results.
+    $script:Solo = -not (Has source collected)
+    $script:NotCol = New-Object System.Collections.Generic.List[string]
+    $script:Look = New-Object System.Collections.Generic.List[string]
     $script:Partial = (Res source elevated) -eq 'False'
+    if ($Solo -and (Res target elevated) -eq 'False') { Line INFO noadmin 'test VM run not elevated: tasks, shares and TLS bindings may be incomplete' }
     foreach ($chk in $Checks) {
+        if ($Solo -and -not (Has target $chk.File)) { $NotCol.Add($chk.File); continue }
         try { & $chk.Judge } catch { Line ERR $chk.File "$_" }
     }
 
-    $head = @(Res source collected) + @(Res target collected)
-    $legend = 'PASS/DIFF = compared with AVS, OK/FAIL = rule on the test VM, INFO = shown only, ~ expected = normal after the move'
+    if ($Solo) {
+        if (@($Sum) -match '^INFO svcacct ') { $Look.Add('svcacct') }
+        $vm = "$(Res target collected)" -replace '^target (\S+).*$', '$1'
+        $head = @("source $vm not collected (no access to AVS)") + @(Res target collected)
+        $note = @('No PASS/DIFF lines: there is no AVS data to compare with.')
+        $legend = 'OK/FAIL = rule on the test VM, INFO = shown only, ~ expected = normal after the move'
+        $badTag = '^(FAIL|ERR)\s'
+    } else {
+        $head = @(Res source collected) + @(Res target collected); $note = @()
+        $legend = 'PASS/DIFF = compared with AVS, OK/FAIL = rule on the test VM, INFO = shown only, ~ expected = normal after the move'
+        $badTag = '^(DIFF|FAIL|MISS|ERR)\s'
+    }
     $counts = @($Sum) | ForEach-Object { ($_ -split ' ')[0] } | Group-Object | Sort-Object Name | ForEach-Object { '{0} {1}' -f $_.Count, $_.Name }
-    $bad = @(@($Sum) | Where-Object { $_ -match '^(DIFF|FAIL|MISS|ERR)\s' } | ForEach-Object { ($_ -split '\s+')[1] })
+    $bad = @(@($Sum) | Where-Object { $_ -match $badTag -or ($_ -match '^INFO\s+(\S+)' -and $Look -contains $Matches[1]) } | ForEach-Object { ($_ -split '\s+')[1] })
+    # Without a baseline nothing can be called "all good".
+    $none = if ($Solo) { 'no FAIL, review INFO lines with the app owner' } else { 'all good, review INFO lines' }
     $verdict = 'RESULT: {0} -> {1}' -f ($counts -join ', '),
-        $(if ($bad.Count) { 'look at: ' + ($bad -join ', ') + '  (migcheck.ps1 show <name>)' } else { 'all good, review INFO lines' })
-    Set-Content -Path (Join-Path $Root 'report.txt') -Encoding UTF8 -Value (@($head) + $legend + '' + $Sum + $verdict + '' + $Det)
+        $(if ($bad.Count) { 'look at: ' + ($bad -join ', ') + '  (migcheck.ps1 show <name>)' } else { $none })
+    # Added after the counts: it is not a result tag.
+    if ($NotCol.Count) { $Sum.Add('NOT COLLECTED  ' + ($NotCol -join ', ')) }
+    Set-Content -Path (Join-Path $Root 'report.txt') -Encoding UTF8 -Value (@($head) + $legend + $note + '' + $Sum + $verdict + '' + $Det)
     # Run Command keeps only the last 4 KB of output, so the verdict goes last.
-    $head; $Sum; "Detail: $Root\report.txt"; $verdict
+    $head; $note; $Sum; "Detail: $Root\report.txt"; $verdict
 }
 
 # Report sections start with "== <name>", so one check can be printed without the rest.
@@ -607,7 +666,7 @@ function Show-Report {
     $r = Get-Content $rp
     if (-not $Name) {
         # Details first and summary last: Run Command keeps the end of the output if it is too long.
-        $sum = @($r | Where-Object { $_ -match '^(INFO|DIFF|FAIL|MISS|ERR)\s' })
+        $sum = @($r | Where-Object { $_ -match '^(INFO|DIFF|FAIL|MISS|ERR)\s|^NOT COLLECTED' })
         $parts = ($r -join "`n") -split '(?m)^(?===)'
         foreach ($n in ($sum | ForEach-Object { ($_ -split '\s+')[1] })) { $parts | Where-Object { $_ -match "^== $([regex]::Escape($n))\b" } }
         ''; $sum; $r | Where-Object { $_ -like 'RESULT:*' }
