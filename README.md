@@ -28,6 +28,8 @@ cd /home/<user>/migcheck && bash migcheck.sh target --peers 10.1.2.3:1433,app2.f
 
 `--peers` / `-Peers` is optional (inter-tier test). The last line, `RESULT`, says all good or which checks to look at.
 
+**No access to AVS?** Run only `target`. With no `source/` folder the report covers the test VM alone. The header says the source was not collected. There are no PASS/DIFF lines, and checks that would be compared become INFO, listing what the test VM has, with `~ expected` lines still marked. App services on Auto that are not running (Windows), or app units that failed (Linux), are FAIL. Checks with no result file are grouped in one `NOT COLLECTED` line.
+
 **3. Read the details.**
 
 ```
@@ -46,10 +48,11 @@ Full report: `report.txt` next to the script.
 | OK / FAIL | rule checked on the target alone |
 | INFO | shown, not judged |
 | `~ expected` | difference normal after the move (VMware → Azure, isolated test VNet); not counted as DIFF |
+| NOT COLLECTED | target-only report: checks with no result file on the test VM |
 
 ## Gotchas
 
-- **Order matters.** If `source` ran after the recovery point, the target has no `source/` folder and stops. Re-run source, wait for a newer point, test-migrate again.
+- **Order matters.** If `source` ran after the recovery point, the target has no `source/` folder and gives only the target-only report. For a full comparison: re-run source, wait for a newer point, test-migrate again.
 - **Platform guard.** `source` refuses to run on Azure and `target` refuses to run anywhere else (detected via the Microsoft hypervisor / manufacturer).
 - **Run Command shows only the last 4 KB.** The verdict is printed last; use `show <check>` to read the rest piece by piece.
 - **Linux Run Command starts in another folder**: always `cd` to the script folder first.
